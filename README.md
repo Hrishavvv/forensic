@@ -13,7 +13,7 @@ A bash tool that scans your drives for corruption, bad sectors, and malware — 
 - runs filesystem integrity checks (`fsck`, `ntfsfix`, `xfs_repair`, etc.)
 - scans for bad sectors with `badblocks`
 - runs a malware scan with ClamAV
-- saves a full report to `~/forensic_reports/`
+- saves a full report to `~forensic/forensic_reports/`
 
 auto-installs any missing tools it needs (`apt`, `dnf`, `pacman` supported).
 
