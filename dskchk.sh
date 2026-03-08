@@ -12,7 +12,9 @@ RESET='\033[0m'
 
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPORT_FILE="$SCRIPT_DIR/forensic_report_$TIMESTAMP.txt"
+REPORTS_DIR="$SCRIPT_DIR/reports"
+mkdir -p "$REPORTS_DIR"
+REPORT_FILE="$REPORTS_DIR/forensic_report_$TIMESTAMP.txt"
 
 CLAM_AVAILABLE=false
 SMART_AVAILABLE=false
@@ -34,10 +36,69 @@ R_VIRUS_PATH=""
 R_INFECTED_COUNT="0"
 R_INFECTED_FILES=""
 R_TOOLS_MISSING=""
+R_VIRUS_SUMMARY=""
+
+MOUNTED_BY_US=()
+SPINNER_PID=""
 
 log() { echo -e "$1"; }
 separator() { log "${DIM}$(printf '─%.0s' {1..60})${RESET}"; }
 rsep() { printf '%.0s─' {1..70}; echo; }
+
+spin_start() {
+    local msg="$1"
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    (
+        local i=0
+        while true; do
+            printf "\r  ${CYAN}${frames[$i]}${RESET}  %s" "$msg"
+            i=$(( (i+1) % ${#frames[@]} ))
+            sleep 0.1
+        done
+    ) &
+    SPINNER_PID=$!
+    disown "$SPINNER_PID" 2>/dev/null
+}
+
+spin_stop() {
+    local verdict="${1:-}"
+    if [ -n "$SPINNER_PID" ] && kill -0 "$SPINNER_PID" 2>/dev/null; then
+        kill "$SPINNER_PID" 2>/dev/null
+        wait "$SPINNER_PID" 2>/dev/null
+    fi
+    SPINNER_PID=""
+    printf "\r\033[2K"
+    [ -n "$verdict" ] && echo -e "  $verdict"
+}
+
+progress_bar() {
+    local current="$1"
+    local total="$2"
+    local label="$3"
+    local pct=$(( current * 100 / total ))
+    local filled=$(( pct * 40 / 100 ))
+    local empty=$(( 40 - filled ))
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar="${bar}█"; done
+    for ((i=0; i<empty; i++)); do bar="${bar}░"; done
+    printf "\r  ${CYAN}[%s]${RESET} %3d%%  %s" "$bar" "$pct" "$label"
+}
+
+cleanup_mounts() {
+    for mnt in "${MOUNTED_BY_US[@]}"; do
+        if mount | grep -q " $mnt "; then
+            log "${DIM}  Unmounting $mnt (mounted by this tool)…${RESET}"
+            if [ "$EUID" -ne 0 ]; then
+                sudo umount "$mnt" 2>/dev/null || sudo umount -l "$mnt" 2>/dev/null
+            else
+                umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null
+            fi
+        fi
+        rmdir "$mnt" 2>/dev/null
+    done
+}
+
+trap 'spin_stop; cleanup_mounts; echo ""; log "${YELLOW}  Interrupted. Cleaning up…${RESET}"; exit 1' INT TERM
 
 detect_pkg_manager() {
     if command -v apt-get &>/dev/null; then
@@ -66,7 +127,7 @@ try_install() {
         R_TOOLS_MISSING="$R_TOOLS_MISSING $label"
         return 1
     fi
-    log "${YELLOW}⚙  $label not found. Attempting auto-install…${RESET}"
+    spin_start "Installing $label…"
     if [ "$EUID" -ne 0 ]; then
         sudo $PKG_UPDATE 2>/dev/null
         sudo $PKG_INSTALL "$pkg" 2>/dev/null
@@ -77,10 +138,10 @@ try_install() {
     if command -v "$label" &>/dev/null || \
        dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || \
        rpm -q "$pkg" 2>/dev/null | grep -q "$pkg"; then
-        log "${GREEN}✔  $label installed successfully.${RESET}"
+        spin_stop "${GREEN}✔  $label installed successfully.${RESET}"
         return 0
     else
-        log "${RED}✖  Auto-install of $label failed. Checks requiring it will be skipped.${RESET}"
+        spin_stop "${RED}✖  Auto-install of $label failed. Checks requiring it will be skipped.${RESET}"
         R_TOOLS_MISSING="$R_TOOLS_MISSING $label"
         return 1
     fi
@@ -105,45 +166,76 @@ check_deps() {
         }
     fi
 
-    if ! command -v smartctl &>/dev/null; then
-        try_install "smartmontools" "smartctl" && SMART_AVAILABLE=true || SMART_AVAILABLE=false
-    else
-        SMART_AVAILABLE=true
-    fi
+    local dep_pids=()
+    local dep_results_dir
+    dep_results_dir=$(mktemp -d)
 
-    if ! command -v clamscan &>/dev/null; then
-        try_install "clamav" "clamscan" && {
-            log "${CYAN}⚙  Updating ClamAV virus definitions…${RESET}"
-            if [ "$EUID" -ne 0 ]; then
-                sudo freshclam 2>/dev/null && log "${GREEN}✔  Virus definitions updated.${RESET}" || \
-                    log "${YELLOW}⚠  freshclam failed. Definitions may be outdated.${RESET}"
-            else
-                freshclam 2>/dev/null && log "${GREEN}✔  Virus definitions updated.${RESET}" || \
-                    log "${YELLOW}⚠  freshclam failed. Definitions may be outdated.${RESET}"
+    _install_bg() {
+        local pkg="$1" label="$2" varfile="$3"
+        if ! command -v "$label" &>/dev/null; then
+            if [ -z "$PKG_INSTALL" ]; then
+                echo "false" > "$varfile"
+                return
             fi
-            CLAM_AVAILABLE=true
-        } || CLAM_AVAILABLE=false
-    else
+            if [ "$EUID" -ne 0 ]; then
+                sudo $PKG_UPDATE 2>/dev/null
+                sudo $PKG_INSTALL "$pkg" 2>/dev/null
+            else
+                $PKG_UPDATE 2>/dev/null
+                $PKG_INSTALL "$pkg" 2>/dev/null
+            fi
+        fi
+        if command -v "$label" &>/dev/null || \
+           dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || \
+           rpm -q "$pkg" 2>/dev/null | grep -q "$pkg"; then
+            echo "true" > "$varfile"
+        else
+            echo "false" > "$varfile"
+        fi
+    }
+
+    spin_start "Checking and installing optional tools in parallel…"
+
+    _install_bg "smartmontools" "smartctl"  "$dep_results_dir/smart"  &
+    dep_pids+=($!)
+    _install_bg "clamav"        "clamscan"  "$dep_results_dir/clam"   &
+    dep_pids+=($!)
+    _install_bg "e2fsprogs"     "badblocks" "$dep_results_dir/bad"    &
+    dep_pids+=($!)
+    _install_bg "ntfs-3g"       "ntfsfix"   "$dep_results_dir/ntfs"   &
+    dep_pids+=($!)
+    _install_bg "xfsprogs"      "xfs_repair" "$dep_results_dir/xfs"  &
+    dep_pids+=($!)
+
+    for pid in "${dep_pids[@]}"; do
+        wait "$pid" 2>/dev/null
+    done
+    spin_stop
+
+    [ "$(cat "$dep_results_dir/smart" 2>/dev/null)" = "true" ]  && SMART_AVAILABLE=true     || { SMART_AVAILABLE=false;     R_TOOLS_MISSING="$R_TOOLS_MISSING smartctl"; }
+    [ "$(cat "$dep_results_dir/bad"   2>/dev/null)" = "true" ]  && BADBLOCKS_AVAILABLE=true  || { BADBLOCKS_AVAILABLE=false;  R_TOOLS_MISSING="$R_TOOLS_MISSING badblocks"; }
+    [ "$(cat "$dep_results_dir/ntfs"  2>/dev/null)" = "true" ]  && NTFSFIX_AVAILABLE=true    || { NTFSFIX_AVAILABLE=false;    R_TOOLS_MISSING="$R_TOOLS_MISSING ntfsfix"; }
+    [ "$(cat "$dep_results_dir/xfs"   2>/dev/null)" = "true" ]  && XFSREPAIR_AVAILABLE=true  || { XFSREPAIR_AVAILABLE=false;  R_TOOLS_MISSING="$R_TOOLS_MISSING xfs_repair"; }
+
+    if [ "$(cat "$dep_results_dir/clam" 2>/dev/null)" = "true" ]; then
         CLAM_AVAILABLE=true
+        spin_start "Updating ClamAV virus definitions…"
+        if [ "$EUID" -ne 0 ]; then
+            sudo freshclam 2>/dev/null
+        else
+            freshclam 2>/dev/null
+        fi
+        if [ $? -eq 0 ]; then
+            spin_stop "${GREEN}✔  ClamAV virus definitions updated.${RESET}"
+        else
+            spin_stop "${YELLOW}⚠  freshclam failed — definitions may be outdated.${RESET}"
+        fi
+    else
+        CLAM_AVAILABLE=false
+        R_TOOLS_MISSING="$R_TOOLS_MISSING clamscan"
     fi
 
-    if ! command -v badblocks &>/dev/null; then
-        try_install "e2fsprogs" "badblocks" && BADBLOCKS_AVAILABLE=true || BADBLOCKS_AVAILABLE=false
-    else
-        BADBLOCKS_AVAILABLE=true
-    fi
-
-    if ! command -v ntfsfix &>/dev/null; then
-        try_install "ntfs-3g" "ntfsfix" && NTFSFIX_AVAILABLE=true || NTFSFIX_AVAILABLE=false
-    else
-        NTFSFIX_AVAILABLE=true
-    fi
-
-    if ! command -v xfs_repair &>/dev/null; then
-        try_install "xfsprogs" "xfs_repair" && XFSREPAIR_AVAILABLE=true || XFSREPAIR_AVAILABLE=false
-    else
-        XFSREPAIR_AVAILABLE=true
-    fi
+    rm -rf "$dep_results_dir"
 
     log ""
     log "${BOLD}${CYAN}▸ Tool availability:${RESET}"
@@ -169,6 +261,7 @@ show_banner() {
 EOF
     echo -e "${RESET}${BOLD}${BLUE}        Drive Corruption & Malware Forensic Analyser${RESET}"
     echo -e "${DIM}        $(date '+%A, %d %B %Y  %H:%M:%S')${RESET}"
+    echo -e "${DIM}        Reports directory: $REPORTS_DIR${RESET}"
     separator
     echo ""
 }
@@ -236,19 +329,92 @@ select_drive() {
     done
 }
 
+do_mount() {
+    local dev="$1"
+    local fstype="$2"
+
+    local tmp_mnt
+    tmp_mnt="/tmp/forensic_mnt_$(basename "$dev")_$$"
+    mkdir -p "$tmp_mnt"
+
+    local mount_cmd=""
+    case "$fstype" in
+        ntfs) mount_cmd="mount -t ntfs-3g -o ro,noatime" ;;
+        vfat|fat32|fat16) mount_cmd="mount -t vfat -o ro,noatime" ;;
+        exfat) mount_cmd="mount -t exfat -o ro,noatime" ;;
+        *) mount_cmd="mount -o ro,noatime" ;;
+    esac
+
+    local mount_out
+    if [ "$EUID" -ne 0 ]; then
+        mount_out=$(sudo $mount_cmd "$dev" "$tmp_mnt" 2>&1)
+    else
+        mount_out=$($mount_cmd "$dev" "$tmp_mnt" 2>&1)
+    fi
+
+    if mount | grep -q " $tmp_mnt "; then
+        MOUNTED_BY_US+=("$tmp_mnt")
+        echo "$tmp_mnt"
+        return 0
+    fi
+
+    log "${YELLOW}  ⚠  Primary mount failed ($mount_out). Trying fallback (auto-detect)…${RESET}"
+    if [ "$EUID" -ne 0 ]; then
+        mount_out=$(sudo mount -o ro "$dev" "$tmp_mnt" 2>&1)
+    else
+        mount_out=$(mount -o ro "$dev" "$tmp_mnt" 2>&1)
+    fi
+
+    if mount | grep -q " $tmp_mnt "; then
+        MOUNTED_BY_US+=("$tmp_mnt")
+        echo "$tmp_mnt"
+        return 0
+    fi
+
+    log "${RED}  ✖  All mount attempts failed for $dev: $mount_out${RESET}"
+    rmdir "$tmp_mnt" 2>/dev/null
+    echo ""
+    return 1
+}
+
+do_unmount() {
+    local mnt="$1"
+    local lazy=false
+
+    if [ "$EUID" -ne 0 ]; then
+        sudo umount "$mnt" 2>/dev/null || { lazy=true; sudo umount -l "$mnt" 2>/dev/null; }
+    else
+        umount "$mnt" 2>/dev/null || { lazy=true; umount -l "$mnt" 2>/dev/null; }
+    fi
+
+    if mount | grep -q " $mnt "; then
+        log "${RED}  ✖  Could not unmount $mnt.${RESET}"
+        return 1
+    fi
+
+    [ "$lazy" = true ] && log "${YELLOW}  ⚠  Lazy unmount used for $mnt (was busy).${RESET}" \
+                       || log "${GREEN}  ✔  $mnt unmounted cleanly.${RESET}"
+    rmdir "$mnt" 2>/dev/null
+    MOUNTED_BY_US=("${MOUNTED_BY_US[@]/$mnt}")
+    return 0
+}
+
 check_mount_status() {
     log ""
     separator
     log "${BOLD}${BLUE}[1/5] MOUNT STATUS & PARTITION TABLE${RESET}"
     separator
 
-    log "${CYAN}▸ Partitions on $SELECTED_DRIVE:${RESET}"
+    spin_start "Reading partition table…"
     R_PARTITIONS=$(lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT,LABEL,UUID "$SELECTED_DRIVE" 2>/dev/null)
-    echo "$R_PARTITIONS"
-
-    echo ""
-    log "${CYAN}▸ Filesystem identifiers (blkid):${RESET}"
     R_BLKID=$(blkid "${SELECTED_DRIVE}"* 2>/dev/null)
+    spin_stop
+
+    log "${CYAN}▸ Partitions on $SELECTED_DRIVE:${RESET}"
+    echo "$R_PARTITIONS"
+    echo ""
+
+    log "${CYAN}▸ Filesystem identifiers (blkid):${RESET}"
     if [ -n "$R_BLKID" ]; then
         echo "$R_BLKID"
     else
@@ -262,8 +428,7 @@ check_mount_status() {
         log ""
         log "${YELLOW}⚠  Mounted partitions detected:${RESET}"
         echo "$MOUNTED_PARTS"
-        log "${DIM}  fsck cannot check mounted filesystems.${RESET}"
-        R_MOUNT_STATUS="WARNING: Partitions mounted during scan — fsck skipped for those partitions"$'\n'"$MOUNTED_PARTS"
+        R_MOUNT_STATUS="Some partitions were mounted at scan time"$'\n'"$MOUNTED_PARTS"
     else
         log "${GREEN}✔  No partitions currently mounted.${RESET}"
         R_MOUNT_STATUS="All partitions confirmed unmounted at time of scan"
@@ -282,27 +447,37 @@ check_smart() {
         return
     fi
 
-    log "${CYAN}▸ Running SMART health assessment…${RESET}"
+    spin_start "Running SMART health assessment…"
     local smart_out
-    smart_out=$(sudo smartctl -H "$SELECTED_DRIVE" 2>&1)
-    echo "$smart_out"
+    if [ "$EUID" -ne 0 ]; then
+        smart_out=$(sudo smartctl -H "$SELECTED_DRIVE" 2>&1)
+    else
+        smart_out=$(smartctl -H "$SELECTED_DRIVE" 2>&1)
+    fi
     R_SMART_HEALTH="$smart_out"
 
     if echo "$smart_out" | grep -q "PASSED"; then
-        log "${GREEN}✔  SMART status: PASSED${RESET}"
+        spin_stop "${GREEN}✔  SMART status: PASSED${RESET}"
         R_SMART_STATUS="PASSED — drive health self-test returned no failures"
     elif echo "$smart_out" | grep -q "FAILED"; then
-        log "${RED}✖  SMART status: FAILED — drive may be failing!${RESET}"
+        spin_stop "${RED}✖  SMART status: FAILED — drive may be failing!${RESET}"
         R_SMART_STATUS="FAILED — drive health self-test indicates hardware failure risk"
     else
-        log "${YELLOW}⚠  SMART status undetermined (may need root or unsupported device).${RESET}"
+        spin_stop "${YELLOW}⚠  SMART status undetermined (may need root or unsupported device).${RESET}"
         R_SMART_STATUS="UNDETERMINED — smartctl ran but could not confirm pass/fail status"
     fi
 
-    log ""
+    spin_start "Reading SMART attributes…"
+    if [ "$EUID" -ne 0 ]; then
+        R_SMART_ATTRS=$(sudo smartctl -A "$SELECTED_DRIVE" 2>/dev/null \
+            | grep -E "Reallocated|Pending|Uncorrectable|Power_On|Temperature|Seek_Error|Spin_Retry")
+    else
+        R_SMART_ATTRS=$(smartctl -A "$SELECTED_DRIVE" 2>/dev/null \
+            | grep -E "Reallocated|Pending|Uncorrectable|Power_On|Temperature|Seek_Error|Spin_Retry")
+    fi
+    spin_stop
+
     log "${CYAN}▸ Key SMART attributes:${RESET}"
-    R_SMART_ATTRS=$(sudo smartctl -A "$SELECTED_DRIVE" 2>/dev/null \
-        | grep -E "Reallocated|Pending|Uncorrectable|Power_On|Temperature|Seek_Error|Spin_Retry")
     if [ -n "$R_SMART_ATTRS" ]; then
         echo "$R_SMART_ATTRS"
     else
@@ -326,16 +501,34 @@ check_filesystem() {
     fi
 
     R_FS_RESULTS=""
+    local total_parts=${#PARTS[@]}
+    local part_idx=0
 
     for part in "${PARTS[@]}"; do
-        log "${CYAN}▸ Checking: $part${RESET}"
-        local part_result=""
+        ((part_idx++))
+        log "${CYAN}▸ Checking partition $part_idx/$total_parts: $part${RESET}"
 
-        if mount | grep -q "^$part "; then
-            log "${YELLOW}  ⚠  $part is mounted — skipping (unmount first).${RESET}"
-            part_result="SKIPPED (partition mounted)"
-            R_FS_RESULTS="$R_FS_RESULTS"$'\n'"Partition $part: $part_result"
-            continue
+        local was_mounted=false
+        local our_mount=""
+        local existing_mount=""
+
+        existing_mount=$(lsblk -lno MOUNTPOINT "$part" 2>/dev/null | awk 'NF{print;exit}')
+
+        if [ -n "$existing_mount" ]; then
+            was_mounted=true
+            log "${YELLOW}  ⚠  $part is mounted at $existing_mount — unmounting for fsck…${RESET}"
+            if [ "$EUID" -ne 0 ]; then
+                sudo umount "$part" 2>/dev/null || sudo umount -l "$part" 2>/dev/null
+            else
+                umount "$part" 2>/dev/null || umount -l "$part" 2>/dev/null
+            fi
+            if mount | grep -q "^$part "; then
+                log "${RED}  ✖  Cannot unmount $part — skipping fsck.${RESET}"
+                R_FS_RESULTS="$R_FS_RESULTS"$'\n'"Partition : $part"$'\n'"Verdict   : SKIPPED — could not unmount for checking"$'\n'
+                continue
+            else
+                log "${GREEN}  ✔  Unmounted $part successfully.${RESET}"
+            fi
         fi
 
         local fstype
@@ -345,11 +538,15 @@ check_filesystem() {
         local fsck_out=""
         local fsck_verdict=""
 
+        spin_start "Running integrity check on $part ($fstype)…"
+
         case "$fstype" in
             ext2|ext3|ext4)
-                log "${CYAN}  Running e2fsck (read-only, no changes)…${RESET}"
-                fsck_out=$(sudo fsck.ext4 -n "$part" 2>&1)
-                echo "$fsck_out"
+                if [ "$EUID" -ne 0 ]; then
+                    fsck_out=$(sudo fsck.ext4 -n "$part" 2>&1)
+                else
+                    fsck_out=$(fsck.ext4 -n "$part" 2>&1)
+                fi
                 if echo "$fsck_out" | grep -qiE "clean|no problems"; then
                     fsck_verdict="CLEAN — no filesystem errors detected"
                 elif echo "$fsck_out" | grep -qiE "error|corrupt|bad|problem"; then
@@ -359,9 +556,11 @@ check_filesystem() {
                 fi
                 ;;
             vfat|fat32|fat16)
-                log "${CYAN}  Running fsck.vfat (read-only)…${RESET}"
-                fsck_out=$(sudo fsck.vfat -n "$part" 2>&1)
-                echo "$fsck_out"
+                if [ "$EUID" -ne 0 ]; then
+                    fsck_out=$(sudo fsck.vfat -n "$part" 2>&1)
+                else
+                    fsck_out=$(fsck.vfat -n "$part" 2>&1)
+                fi
                 if echo "$fsck_out" | grep -qi "no errors"; then
                     fsck_verdict="CLEAN — no FAT filesystem errors detected"
                 elif echo "$fsck_out" | grep -qiE "error|corrupt|bad"; then
@@ -372,9 +571,11 @@ check_filesystem() {
                 ;;
             ntfs)
                 if [ "$NTFSFIX_AVAILABLE" = true ]; then
-                    log "${CYAN}  Running ntfsfix (check only)…${RESET}"
-                    fsck_out=$(sudo ntfsfix -n "$part" 2>&1)
-                    echo "$fsck_out"
+                    if [ "$EUID" -ne 0 ]; then
+                        fsck_out=$(sudo ntfsfix -n "$part" 2>&1)
+                    else
+                        fsck_out=$(ntfsfix -n "$part" 2>&1)
+                    fi
                     if echo "$fsck_out" | grep -qi "no errors\|consistent"; then
                         fsck_verdict="CLEAN — NTFS filesystem consistent"
                     elif echo "$fsck_out" | grep -qiE "error|corrupt|inconsisten"; then
@@ -383,17 +584,23 @@ check_filesystem() {
                         fsck_verdict="CHECK COMPLETE — review raw output for details"
                     fi
                 else
-                    log "${YELLOW}  ⚠  ntfsfix unavailable. Falling back to generic fsck (limited NTFS support)…${RESET}"
-                    fsck_out=$(sudo fsck -n "$part" 2>&1)
-                    echo "$fsck_out"
+                    spin_stop "${YELLOW}  ⚠  ntfsfix unavailable. Falling back to generic fsck…${RESET}"
+                    spin_start "Running generic fsck on $part…"
+                    if [ "$EUID" -ne 0 ]; then
+                        fsck_out=$(sudo fsck -n "$part" 2>&1)
+                    else
+                        fsck_out=$(fsck -n "$part" 2>&1)
+                    fi
                     fsck_verdict="CHECK PERFORMED (generic fsck fallback — limited NTFS accuracy)"
                 fi
                 ;;
             xfs)
                 if [ "$XFSREPAIR_AVAILABLE" = true ]; then
-                    log "${CYAN}  Running xfs_repair (dry-run)…${RESET}"
-                    fsck_out=$(sudo xfs_repair -n "$part" 2>&1)
-                    echo "$fsck_out"
+                    if [ "$EUID" -ne 0 ]; then
+                        fsck_out=$(sudo xfs_repair -n "$part" 2>&1)
+                    else
+                        fsck_out=$(xfs_repair -n "$part" 2>&1)
+                    fi
                     if echo "$fsck_out" | grep -qi "no modify"; then
                         fsck_verdict="CLEAN — XFS filesystem no repairs needed"
                     elif echo "$fsck_out" | grep -qiE "would fix|error|corrupt"; then
@@ -402,16 +609,17 @@ check_filesystem() {
                         fsck_verdict="CHECK COMPLETE — review raw output for details"
                     fi
                 else
-                    log "${YELLOW}  ⚠  xfs_repair unavailable — XFS integrity check skipped.${RESET}"
                     fsck_out="xfs_repair not available"
                     fsck_verdict="SKIPPED — xfs_repair not installed"
                 fi
                 ;;
             btrfs)
                 if command -v btrfs &>/dev/null; then
-                    log "${CYAN}  Running btrfs check (read-only)…${RESET}"
-                    fsck_out=$(sudo btrfs check --readonly "$part" 2>&1)
-                    echo "$fsck_out"
+                    if [ "$EUID" -ne 0 ]; then
+                        fsck_out=$(sudo btrfs check --readonly "$part" 2>&1)
+                    else
+                        fsck_out=$(btrfs check --readonly "$part" 2>&1)
+                    fi
                     if echo "$fsck_out" | grep -qi "no error"; then
                         fsck_verdict="CLEAN — btrfs filesystem no errors found"
                     elif echo "$fsck_out" | grep -qiE "error|corrupt"; then
@@ -420,34 +628,55 @@ check_filesystem() {
                         fsck_verdict="CHECK COMPLETE — review raw output for details"
                     fi
                 else
-                    log "${YELLOW}  ⚠  btrfs tools not found. Attempting install…${RESET}"
-                    try_install "btrfs-progs" "btrfs" && {
-                        fsck_out=$(sudo btrfs check --readonly "$part" 2>&1)
-                        echo "$fsck_out"
-                        fsck_verdict="CHECK COMPLETE (btrfs auto-installed)"
-                    } || {
-                        fsck_out="btrfs-progs install failed"
-                        fsck_verdict="SKIPPED — btrfs tools could not be installed"
-                    }
+                    fsck_out="btrfs-progs not available"
+                    fsck_verdict="SKIPPED — btrfs tools not installed"
                 fi
                 ;;
             "")
-                log "${YELLOW}  ⚠  Filesystem undetectable — running generic fsck as fallback…${RESET}"
-                fsck_out=$(sudo fsck -n "$part" 2>&1)
-                echo "$fsck_out"
+                if [ "$EUID" -ne 0 ]; then
+                    fsck_out=$(sudo fsck -n "$part" 2>&1)
+                else
+                    fsck_out=$(fsck -n "$part" 2>&1)
+                fi
                 fsck_verdict="CHECK PERFORMED (generic fsck — filesystem type unknown)"
                 ;;
             *)
-                log "${YELLOW}  ⚠  Unsupported filesystem '$fstype' — running generic fsck as fallback…${RESET}"
-                fsck_out=$(sudo fsck -n "$part" 2>&1)
-                echo "$fsck_out"
+                if [ "$EUID" -ne 0 ]; then
+                    fsck_out=$(sudo fsck -n "$part" 2>&1)
+                else
+                    fsck_out=$(fsck -n "$part" 2>&1)
+                fi
                 fsck_verdict="CHECK PERFORMED (generic fsck fallback for '$fstype')"
                 ;;
         esac
 
+        if echo "$fsck_verdict" | grep -qi "CLEAN"; then
+            spin_stop "${GREEN}  ✔  $part — $fsck_verdict${RESET}"
+        elif echo "$fsck_verdict" | grep -qi "ERRORS"; then
+            spin_stop "${RED}  ✖  $part — $fsck_verdict${RESET}"
+        else
+            spin_stop "${YELLOW}  ⚠  $part — $fsck_verdict${RESET}"
+        fi
+
+        if [ "$was_mounted" = true ] && [ -n "$existing_mount" ]; then
+            log "${CYAN}  ↩  Re-mounting $part at $existing_mount…${RESET}"
+            if [ "$EUID" -ne 0 ]; then
+                sudo mount "$part" "$existing_mount" 2>/dev/null && \
+                    log "${GREEN}  ✔  Re-mounted successfully.${RESET}" || \
+                    log "${YELLOW}  ⚠  Re-mount failed — $part remains unmounted.${RESET}"
+            else
+                mount "$part" "$existing_mount" 2>/dev/null && \
+                    log "${GREEN}  ✔  Re-mounted successfully.${RESET}" || \
+                    log "${YELLOW}  ⚠  Re-mount failed — $part remains unmounted.${RESET}"
+            fi
+        fi
+
         R_FS_RESULTS="$R_FS_RESULTS"$'\n'"Partition : $part"$'\n'"Filesystem: ${fstype:-unknown}"$'\n'"Verdict   : $fsck_verdict"$'\n'"Raw Output:"$'\n'"$fsck_out"$'\n'
+
+        progress_bar "$part_idx" "$total_parts" "Filesystem checks"
         echo ""
     done
+    echo ""
 }
 
 check_bad_sectors() {
@@ -466,11 +695,35 @@ check_bad_sectors() {
     read -r do_bad
     if [[ "$do_bad" =~ ^[Yy]$ ]]; then
         log "${CYAN}▸ Scanning $SELECTED_DRIVE for bad sectors…${RESET}"
+
+        local tmpfile
+        tmpfile=$(mktemp)
+
+        if [ "$EUID" -ne 0 ]; then
+            sudo badblocks -vs "$SELECTED_DRIVE" > "$tmpfile" 2>&1 &
+        else
+            badblocks -vs "$SELECTED_DRIVE" > "$tmpfile" 2>&1 &
+        fi
+        local bb_pid=$!
+
+        local dot_count=0
+        while kill -0 "$bb_pid" 2>/dev/null; do
+            local elapsed_blocks
+            elapsed_blocks=$(grep -c "." "$tmpfile" 2>/dev/null || echo 0)
+            printf "\r  ${CYAN}⠿${RESET}  Scanning blocks… (%s lines processed)" "$elapsed_blocks"
+            sleep 1
+        done
+        wait "$bb_pid"
+        printf "\r\033[2K"
+
         local bad_out
-        bad_out=$(sudo badblocks -vs "$SELECTED_DRIVE" 2>&1)
+        bad_out=$(cat "$tmpfile")
+        rm -f "$tmpfile"
+
         echo "$bad_out"
+
         local bad_count
-        bad_count=$(echo "$bad_out" | grep -c "bad block" || true)
+        bad_count=$(echo "$bad_out" | grep -c "bad block" 2>/dev/null || echo 0)
         if [ "$bad_count" -gt 0 ]; then
             log "${RED}✖  Bad sectors found: $bad_count block(s) affected!${RESET}"
             R_BAD_SECTORS="FAILED — $bad_count bad block(s) detected on $SELECTED_DRIVE"$'\n'"$bad_out"
@@ -500,12 +753,27 @@ check_viruses() {
     scan_path=$(lsblk -lno MOUNTPOINT "$SELECTED_DRIVE" 2>/dev/null | awk 'NF{print;exit}')
 
     if [ -z "$scan_path" ]; then
-        echo -ne "${BOLD}${GREEN}▸ Drive not mounted. Enter mount point to scan (or Enter to skip): ${RESET}"
-        read -r scan_path
+        log "${YELLOW}▸ Drive not mounted. Attempting to mount for virus scan…${RESET}"
+        local fstype
+        fstype=$(blkid -o value -s TYPE "${SELECTED_DRIVE}1" 2>/dev/null)
+        [ -z "$fstype" ] && fstype=$(blkid -o value -s TYPE "$SELECTED_DRIVE" 2>/dev/null)
+
+        spin_start "Mounting $SELECTED_DRIVE…"
+        scan_path=$(do_mount "${SELECTED_DRIVE}1" "$fstype" 2>/dev/null)
+        [ -z "$scan_path" ] && scan_path=$(do_mount "$SELECTED_DRIVE" "$fstype" 2>/dev/null)
+        spin_stop
+
         if [ -z "$scan_path" ]; then
-            log "${DIM}  Virus scan skipped.${RESET}"
-            R_VIRUS_STATUS="SKIPPED — drive not mounted and no path provided"
-            return
+            log "${YELLOW}  ⚠  Auto-mount failed.${RESET}"
+            echo -ne "${BOLD}${GREEN}▸ Enter mount point manually (or Enter to skip): ${RESET}"
+            read -r scan_path
+            if [ -z "$scan_path" ]; then
+                log "${DIM}  Virus scan skipped.${RESET}"
+                R_VIRUS_STATUS="SKIPPED — drive not mounted and auto-mount failed"
+                return
+            fi
+        else
+            log "${GREEN}  ✔  Drive mounted at $scan_path for scanning.${RESET}"
         fi
     fi
 
@@ -517,10 +785,26 @@ check_viruses() {
 
     R_VIRUS_PATH="$scan_path"
     log "${CYAN}▸ Scanning $scan_path with ClamAV…${RESET}"
-    echo ""
+
+    local tmpfile
+    tmpfile=$(mktemp)
+    local scanned=0
+
+    clamscan -r --bell -i "$scan_path" > "$tmpfile" 2>&1 &
+    local clam_pid=$!
+
+    while kill -0 "$clam_pid" 2>/dev/null; do
+        scanned=$(grep -c "^/" "$tmpfile" 2>/dev/null || echo 0)
+        printf "\r  ${CYAN}⠿${RESET}  Scanning… (%s files scanned)" "$scanned"
+        sleep 0.5
+    done
+    wait "$clam_pid"
+    printf "\r\033[2K"
 
     local clam_out
-    clam_out=$(clamscan -r --bell -i "$scan_path" 2>&1)
+    clam_out=$(cat "$tmpfile")
+    rm -f "$tmpfile"
+
     echo "$clam_out"
 
     R_INFECTED_COUNT=$(echo "$clam_out" | grep "^Infected files:" | awk '{print $3}')
@@ -530,6 +814,7 @@ check_viruses() {
     scanned_files=$(echo "$clam_out" | grep "^Scanned files:" | awk '{print $3}')
     known_viruses=$(echo "$clam_out" | grep "Known viruses:" | awk '{print $3}')
 
+    echo ""
     if [ "$R_INFECTED_COUNT" = "0" ]; then
         log "${GREEN}✔  No malware detected. Drive appears clean.${RESET}"
         R_VIRUS_STATUS="CLEAN — no malware or infected files detected"
@@ -550,7 +835,11 @@ write_report() {
     drive_model=$(lsblk -dno MODEL "$SELECTED_DRIVE" 2>/dev/null | xargs)
     drive_size=$(lsblk -dno SIZE "$SELECTED_DRIVE" 2>/dev/null | xargs)
     drive_tran=$(lsblk -dno TRAN "$SELECTED_DRIVE" 2>/dev/null | xargs)
-    drive_serial=$(sudo smartctl -i "$SELECTED_DRIVE" 2>/dev/null | grep "Serial Number" | awk -F: '{print $2}' | xargs)
+    if [ "$EUID" -ne 0 ]; then
+        drive_serial=$(sudo smartctl -i "$SELECTED_DRIVE" 2>/dev/null | grep "Serial Number" | awk -F: '{print $2}' | xargs)
+    else
+        drive_serial=$(smartctl -i "$SELECTED_DRIVE" 2>/dev/null | grep "Serial Number" | awk -F: '{print $2}' | xargs)
+    fi
 
     {
         echo "========================================================================"
@@ -562,7 +851,7 @@ write_report() {
         echo "  Analyst User  : $(whoami)"
         echo "  Analysis Start: $R_START_TIME"
         echo "  Analysis End  : $end_time"
-        echo "  Tool Version  : Forensic Drive Analyser v1.0"
+        echo "  Tool Version  : Forensic Drive Analyser v2.0"
         echo ""
         rsep
         echo "  SECTION 1 — TARGET DRIVE IDENTIFICATION"
@@ -709,6 +998,7 @@ write_report() {
 }
 
 show_summary() {
+    cleanup_mounts
     write_report
     log ""
     separator
@@ -716,6 +1006,7 @@ show_summary() {
     separator
     log "  Drive analysed : ${YELLOW}$SELECTED_DRIVE${RESET}"
     log "  Finished       : $(date '+%Y-%m-%d %H:%M:%S')"
+    log "  Reports folder : ${CYAN}$REPORTS_DIR${RESET}"
     log "  Report saved   : ${CYAN}$REPORT_FILE${RESET}"
     separator
     echo ""
